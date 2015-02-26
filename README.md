@@ -9,7 +9,6 @@ To install, copy to $APPDATA\Hex-Rays\idapythonrc.py.  IDA Pro loads this file u
 Examples
 --------
 ...
-#!/usr/bin/env python
 
 func = Function(ScreenEA())
 func.call_tree()
