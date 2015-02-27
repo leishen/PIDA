@@ -4,8 +4,12 @@
 from __future__ import print_function
 import re
 from idaapi import FlowChart, get_func, BADADDR
+from idautils import Functions, DecodeInstruction, XrefsFrom, XrefsTo
+from idc import (FindFuncEnd, GetManyBytes, GetOpnd, MakeFunction, GetFunctionName, GetFuncOffset, SetFunctionCmt,
+                 GetFunctionCmt)
 
 # check cref_t and dref_t
+
 
 # @TODO Need a better name for this
 class UnexpectedError(ValueError):
@@ -58,10 +62,10 @@ class Operand(object):
         self._opnum = opnum
 
     @classmethod
-    def from_op_t(cls, op_t, insn):
-        for c in cls.__subclasses__:
+    def from_op_t(cls, op_t, insn, opnum):
+        for c in cls.__subclasses__():
             if c.VALUE == op_t.type:
-                return c(op_t, insn)
+                return c(op_t, insn, opnum)
 
     @property
     def offset(self):
@@ -80,7 +84,7 @@ class Operand(object):
         return self._op.dtyp
 
     def __str__(self):
-        return GetOpnd(self._insn, self._opnum)
+        return GetOpnd(self._insn.addr, self._opnum)
 
 
 class RegisterOperand(Operand):
@@ -195,14 +199,18 @@ class Instruction(object):
 
     @property
     def bytes(self):
-        # bytes of i.addr + i.size
-        return list(GetManyBytes(i.addr, i.size))
+        return list(GetManyBytes(self.addr, self.size))
+
+    def iter_operands(self):
+        i = 0
+        for o in self._insn.Operands:
+            if o.type != 0:         # 0 is a void operand, meaning it's not used in IDA
+                yield Operand.from_op_t(o, self, i)
+            i += 1
 
     @property
     def operands(self):
-        for o in self._insn.Operands:
-            if o.type != 0:         # 0 is a void operand, meaning it's not used in IDA
-                yield Operand(o, self)
+        return list(self.iter_operands())
 
     def is_branch(self):
         pass
@@ -216,8 +224,8 @@ class Instruction(object):
     def __len__(self):
         return self.size
 
-    def __getitem__(self, item):
-        return Operand(self._insn.Operands[item], self)
+    #def __getitem__(self, item):
+    #    return Operand.from_op_t(self._insn.Operands[item], self)
 
 
 class CodeBlock(object):
@@ -235,20 +243,23 @@ class CodeBlock(object):
         # End is not uniform among blocks in IDA, so we need to subclass this to do it properly
         raise NotImplementedError()
 
-    @property
-    def instructions(self):
+    def iter_instructions(self):
         """Generator that yields the Instruction objects within this CodeBlock"""
         ea = self.start
-        if self.end() < ea:
+        if self.end < ea:
             # This is a problem
             raise UnexpectedError("end ea is before start ea")
-        while ea < self.end():
+        while ea < self.end:
             try:
                 instr = Instruction(ea)
                 yield instr
                 ea += instr.size
-            except:
+            except Exception as e:
                 ea += 1
+
+    @property
+    def instructions(self):
+        return list(self.iter_instructions())
 
     @property
     def bytes(self):
@@ -272,17 +283,23 @@ class BasicBlock(CodeBlock):
         """End (final address) of the block"""
         return self._bb.endEA
 
-    @property
-    def successors(self):
+    def iter_successors(self):
         """Exit nodes for this basic block, as BasicBlocks"""
         for b in self._bb.succs():
             yield self.__class__(b)
 
     @property
-    def predecessors(self):
+    def successors(self):
+        return list(self.iter_successors())
+
+    def iter_predecessors(self):
         """Blocks the enter this one"""
         for b in self._bb.preds():
             yield self.__class__(b)
+
+    @property
+    def predecessors(self):
+        return list(self.iter_predecessors())
 
     def __eq__(self, other):
         return other.start == self.start
@@ -316,7 +333,7 @@ class Loop(object):
     def add(self, block_ea):
         if block_ea not in self._block_addrs:
             func = get_func(block_ea)
-            for b in FlowChart(f):
+            for b in FlowChart(func):
                 if block_ea == b.startEA:
                     self._block_addrs[block_ea] = BasicBlock(b)
 
@@ -341,6 +358,12 @@ class Function(CodeBlock):
         """Create a new function"""
         f = MakeFunction(start_ea, end_ea)
         return cls(start_ea)
+
+    @classmethod
+    def iter_all(cls):
+        """Iterate over all functions"""
+        for f in Functions():
+            yield cls(f)
 
     @property
     def name(self):
@@ -386,6 +409,7 @@ class Function(CodeBlock):
         # TODO How do I do this?
         pass
 
+    @property
     def loops(self):
         """Return the begin and end of any loops in a function"""
         # Note: This is not very efficient, but it gets the job done
@@ -406,12 +430,16 @@ class Function(CodeBlock):
         _dfs(blocks[0], loops=loops)
         return loops.values()
 
-    def callers(self):
+    def iter_callers(self):
         """Return a list of Xrefs to this function"""
         for r in XrefsTo(self.start):
             yield Xref(r)
 
-    def callees(self, recursive=False, parents=[], depth=0):
+    @property
+    def callers(self):
+        return list(self.iter_callers())
+
+    def iter_callees(self, recursive=False, parents=[], depth=0):
         """List of functions called by this one."""
         for i in self.instructions:
             if i.mnemonic.lower() == "call":
@@ -420,13 +448,17 @@ class Function(CodeBlock):
                 func = Function(xr.to)
                 yield depth, i.addr, func
                 if recursive and func.start not in parents:
-                    for d, ea, f in func.callees(recursive=True, parents=parents+[self.start], depth=depth+1):
+                    for d, ea, f in func.iter_callees(recursive=True, parents=parents+[self.start], depth=depth+1):
                         yield d, ea, f
+
+    @property
+    def callees(self):
+        return list(self.iter_callees())
 
     def call_tree(self):
         """Print a pretty, recursive call tree from this function"""
         print("[{0:#x}] {1}".format(self.start, self.name))
-        for d, ea, f in self.callees(recursive=True, depth=1):
+        for d, ea, f in self.iter_callees(recursive=True, depth=1):
             print("{0}[{1:#x}] {2}".format(d * "  ", ea, f.name))
 
     @property
@@ -434,12 +466,15 @@ class Function(CodeBlock):
         """The final EA in the function"""
         return FindFuncEnd(self._start)
 
-    @property
-    def blocks(self):
+    def iter_blocks(self):
         """Return the basic blocks in the function"""
         f = get_func(self.start)
         for b in FlowChart(f):
             yield BasicBlock(b)
+
+    @property
+    def blocks(self):
+        return list(self.iter_blocks())
 
 
 def label_class_methods():
