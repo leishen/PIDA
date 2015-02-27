@@ -11,8 +11,12 @@ from idc import (FindFuncEnd, GetManyBytes, GetOpnd, MakeFunction, GetFunctionNa
 # check cref_t and dref_t
 
 
-# @TODO Need a better name for this
+# TODO Need a better name for this
 class UnexpectedError(ValueError):
+    pass
+
+
+class InvalidInstruction(ValueError):
     pass
 
 
@@ -56,6 +60,8 @@ OPERAND_DATA_TYPES = {
 
 class Operand(object):
     """Operand of a single instruction"""
+    VALUE = 0
+
     def __init__(self, op_t, insn, opnum):
         self._op = op_t
         self._insn = insn
@@ -63,16 +69,19 @@ class Operand(object):
 
     @classmethod
     def from_op_t(cls, op_t, insn, opnum):
+        """Really an operand factory, returning the properly classed Operand"""
         for c in cls.__subclasses__():
             if c.VALUE == op_t.type:
                 return c(op_t, insn, opnum)
 
     @property
     def offset(self):
+        """Byte offset in the instruction to this operand"""
         return self._op.offb
 
     @property
     def opnum(self):
+        """Operand number for the instruction"""
         return self._op.n
 
     @property
@@ -180,6 +189,8 @@ class Instruction(object):
     def __init__(self, ea):
         self._ea = ea
         self._insn = DecodeInstruction(ea)
+        if self._insn is None:
+            raise InvalidInstruction("")
 
     @property
     def mnemonic(self):
@@ -224,8 +235,13 @@ class Instruction(object):
     def __len__(self):
         return self.size
 
-    #def __getitem__(self, item):
-    #    return Operand.from_op_t(self._insn.Operands[item], self)
+    def __str__(self):
+        inst = "{0} ".format(self.mnemonic)
+        for o in self.operands[:-1]:
+            inst += "{0}, ".format(str(o))
+        if len(self.operands) > 0:
+            inst += "{0}".format(self.operands[-1])
+        return inst
 
 
 class CodeBlock(object):
@@ -236,7 +252,7 @@ class CodeBlock(object):
     @property
     def start(self):
         """Beginning of the block"""
-        return self._start
+        raise NotImplementedError()
 
     @property
     def end(self):
@@ -247,14 +263,14 @@ class CodeBlock(object):
         """Generator that yields the Instruction objects within this CodeBlock"""
         ea = self.start
         if self.end < ea:
-            # This is a problem
+            # XXX This is a problem
             raise UnexpectedError("end ea is before start ea")
         while ea < self.end:
             try:
                 instr = Instruction(ea)
                 yield instr
                 ea += instr.size
-            except Exception as e:
+            except InvalidInstruction:
                 ea += 1
 
     @property
@@ -264,8 +280,7 @@ class CodeBlock(object):
     @property
     def bytes(self):
         """List of bytes in the code block"""
-        # @TODO Implement this
-        pass
+        return list(GetManyBytes(self.start, self.end - self.start))
 
 
 class BasicBlock(CodeBlock):
@@ -308,11 +323,14 @@ class BasicBlock(CodeBlock):
         return "BasicBlock(start={0:#x}, end={1:#x})".format(self.start, self.end)
 
 
+# I don't really like this API yet
 class Loop(object):
-    """Start, comparator, contained nodes"""
-    def __init__(self, start_block, end_block, blocks=[]):
-        self._start_block_ea = start_block  # Basic block
-        self._end_block_ea = end_block      # Basic block
+    """A loop in a function.  A loop is characterized by a starting basic block (the head), an ending basic block (the
+    tail), and the total set of contained basic blocks containing all paths.
+    """
+    def __init__(self, start_block, end_block, blocks=()):
+        self._start_block_ea = start_block
+        self._end_block_ea = end_block
         self._blocks = {}
         # Cache the blocks for more efficient lookup
         f = get_func(start_block)
@@ -323,32 +341,30 @@ class Loop(object):
     @property
     def head(self):
         return self._blocks[self._start_block_ea]
-        #return BasicBlock(self._start_block_ea)
 
     @property
     def tail(self):
         return self._blocks[self._end_block_ea]
-        #return BasicBlock(self._end_block_ea)
 
     def add(self, block_ea):
-        if block_ea not in self._block_addrs:
+        """Add a block (by address) to the loop"""
+        if block_ea not in self._blocks:
             func = get_func(block_ea)
             for b in FlowChart(func):
                 if block_ea == b.startEA:
-                    self._block_addrs[block_ea] = BasicBlock(b)
+                    self._blocks[block_ea] = BasicBlock(b)
 
     def update(self, loop):
         self._blocks.update(loop._blocks)
 
     def __str__(self):
-        return "{0:#x}, {1:#x}, {2} nodes".format(self.head.start, self.tail.start, len(self._blocks))
+        return "{0:#x}, {1:#x}, {2} blocks".format(self.head.start, self.tail.start, len(self._blocks))
 
 
 class Function(CodeBlock):
     """Represents a function in a disassembly"""
     def __init__(self, ea):
         self._start = get_func(ea).startEA
-        #self._blocks = {}
 
     def __contains__(self, ea):
         return get_func(self.start).contains(ea)
@@ -356,49 +372,58 @@ class Function(CodeBlock):
     @classmethod
     def create(cls, start_ea, end_ea=BADADDR):
         """Create a new function"""
-        f = MakeFunction(start_ea, end_ea)
+        MakeFunction(start_ea, end_ea)
         return cls(start_ea)
 
     @classmethod
     def iter_all(cls):
-        """Iterate over all functions"""
+        """Iterate over all functions in the disassembly"""
         for f in Functions():
             yield cls(f)
 
     @property
     def name(self):
         """The name for the function.  E.g., sub_abcd1234"""
-        return GetFunctionName(self._ea)
+        return GetFunctionName(self.start)
 
     @property
     def offset(self):
         """The file offset for the function"""
-        return GetFuncOffset(self._ea)
+        return GetFuncOffset(self.start)
 
-    def repeatable():
-        doc = """Repeatable comment for the function"""
-        def fget(self):
-            return GetFunctionCmt(self.start, 1)
-        def fset(self, cmt):
-            return SetFunctionCmt(self.start, cmt, 1)
-        return locals()
-    repeatable = property(**repeatable())
+    @property
+    def start(self):
+        return self._start
 
-    def comment():
-        doc = """Non-repeatable comment for the function"""
-        def fget(self):
-            return GetFunctionCmt(self.start, 0)
-        def fset(self, cmt):
-            return SetFunctionCmt(self.start, cmt, 0)
-        return locals()
-    comment = property(**comment())
+    @property
+    def end(self):
+        """The final EA in the function"""
+        return FindFuncEnd(self.start)
+
+    @property
+    def repeatable(self):
+        """Get and set the repeatable comment for the function"""
+        return GetFunctionCmt(self.start, 1)
+
+    @repeatable.setter
+    def repeatable(self, cmt):
+        return SetFunctionCmt(self.start, cmt, 1)
+
+    @property
+    def comment(self):
+        """Get and set the non-repeatable comment for the function"""
+        return GetFunctionCmt(self.start, 0)
+
+    @comment.setter
+    def comment(self, cmt):
+        return SetFunctionCmt(self.start, cmt, 0)
 
     @property
     def no_return(self):
         return not get_func(self.start).does_return()
 
     def is_thunk(self):
-        # @TODO How do I do this other than checking for no return?
+        # TODO How do I do this other than checking for no return?
         pass
 
     def args(self):
@@ -437,10 +462,12 @@ class Function(CodeBlock):
 
     @property
     def callers(self):
+        """List of callers to the function, as Xref objects"""
         return list(self.iter_callers())
 
+    # TODO Split this function into a worker to cleanup the API
     def iter_callees(self, recursive=False, parents=[], depth=0):
-        """List of functions called by this one."""
+        """List of functions called by this one"""
         for i in self.instructions:
             if i.mnemonic.lower() == "call":
                 # Get the call destination
@@ -453,6 +480,7 @@ class Function(CodeBlock):
 
     @property
     def callees(self):
+        """List of functions called by this function"""
         return list(self.iter_callees())
 
     def call_tree(self):
@@ -462,9 +490,12 @@ class Function(CodeBlock):
             print("{0}[{1:#x}] {2}".format(d * "  ", ea, f.name))
 
     @property
-    def end(self):
-        """The final EA in the function"""
-        return FindFuncEnd(self._start)
+    def exit_nodes(self):
+        pass
+
+    @property
+    def entrance_nodes(self):
+        pass
 
     def iter_blocks(self):
         """Return the basic blocks in the function"""
@@ -474,14 +505,5 @@ class Function(CodeBlock):
 
     @property
     def blocks(self):
+        """List of basic blocks in the function"""
         return list(self.iter_blocks())
-
-
-def label_class_methods():
-    # Make sure we run Class Informer on the binary first.  We need its output
-    #
-    # for all functions:
-    #   for all instructions
-    #       if instruction refers to vtable and dst is [reg]:
-    #           rename funciton to vtable_name::vtable_name
-    pass
